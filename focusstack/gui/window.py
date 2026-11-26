@@ -153,7 +153,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.retouch_group.add(brush_row)
 
         hard_row = Adw.ActionRow(title="Twardość krawędzi")
-        self.hard_adj = Gtk.Adjustment(value=0.5, lower=0.0, upper=0.95, step_increment=0.05)
+        self.hard_adj = Gtk.Adjustment(value=0.3, lower=0.0, upper=0.95, step_increment=0.05)
         hard_scale = Gtk.Scale(adjustment=self.hard_adj, hexpand=True, draw_value=False,
                                valign=Gtk.Align.CENTER)
         hard_scale.set_size_request(120, -1)
