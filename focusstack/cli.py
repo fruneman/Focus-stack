@@ -18,7 +18,7 @@ def main() -> int:
     ap.add_argument("--no-align", action="store_true")
     ap.add_argument("--no-crop", action="store_true")
     ap.add_argument("--consistency", type=int, default=5)
-    ap.add_argument("--fine-weight", type=float, default=1.0)
+    ap.add_argument("--fine-weight", type=float, default=0.8)
     a = ap.parse_args()
 
     s = pipeline.Settings(method=a.method, do_align=not a.no_align, crop=not a.no_crop,

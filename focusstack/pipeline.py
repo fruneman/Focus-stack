@@ -22,10 +22,11 @@ class Settings:
     # pyramid
     neighborhood: float = 1.5
     consistency: int = 5
-    fine_weight: float = 1.0
+    fine_weight: float = 0.8
+    base_sharpness: float = 8.0
     # depthmap
-    smoothing: float = 4.0
-    blend: float = 2.0
+    smoothing: float = 6.0
+    contrast: float = 6.0
 
 
 @dataclass
@@ -63,10 +64,11 @@ def run(paths: Sequence[str], settings: Settings | None = None,
     depth = None
     if settings.method == "depthmap":
         img, depth = stack_mod.stack_depthmap(len(paths), load, sub(0.3, 1.0),
-                                              settings.smoothing, settings.blend)
+                                              settings.smoothing, settings.contrast)
     else:
         img = stack_mod.stack_pyramid(len(paths), load, sub(0.3, 1.0), settings.neighborhood,
-                                      settings.consistency, settings.fine_weight)
+                                      settings.consistency, settings.fine_weight,
+                                      settings.base_sharpness)
 
     if settings.crop and al.crop:
         x, y, w, h = al.crop
