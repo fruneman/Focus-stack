@@ -29,18 +29,40 @@ class Settings:
     contrast: float = 6.0
 
 
+class Cancelled(Exception):
+    """Użytkownik przerwał obliczenia."""
+
+
 @dataclass
 class Result:
     image: np.ndarray
     bits: int
     alignment: align_mod.Alignment
+    paths: list[str]
+    crop: tuple[int, int, int, int] | None
     depth: np.ndarray | None = None
+
+    def frame(self, index: int) -> np.ndarray:
+        """Klatka źródłowa dopasowana i przycięta dokładnie jak wynik (do retuszu)."""
+        img, _ = imageio.load(self.paths[index])
+        img = self.alignment.warp(img, index)
+        if self.crop:
+            x, y, w, h = self.crop
+            img = img[y:y + h, x:x + w]
+        return np.ascontiguousarray(img)
 
 
 def run(paths: Sequence[str], settings: Settings | None = None,
-        progress: ProgressFn | None = None) -> Result:
+        progress: ProgressFn | None = None,
+        cancelled: Callable[[], bool] | None = None) -> Result:
     settings = settings or Settings()
-    progress = progress or (lambda f, m: None)
+    user_progress = progress or (lambda f, m: None)
+
+    def progress(f: float, m: str) -> None:
+        if cancelled is not None and cancelled():
+            raise Cancelled()
+        user_progress(f, m)
+
     paths = list(paths)
     if len(paths) < 2:
         raise ValueError("Potrzebne są co najmniej 2 zdjęcia")
@@ -70,10 +92,11 @@ def run(paths: Sequence[str], settings: Settings | None = None,
                                       settings.consistency, settings.fine_weight,
                                       settings.base_sharpness)
 
-    if settings.crop and al.crop:
-        x, y, w, h = al.crop
-        img = img[y:y + h, x:x + w]
+    crop = al.crop if settings.crop else None
+    if crop:
+        x, y, w, h = crop
+        img = np.ascontiguousarray(img[y:y + h, x:x + w])
         if depth is not None:
             depth = depth[y:y + h, x:x + w]
 
-    return Result(image=img, bits=bits, alignment=al, depth=depth)
+    return Result(image=img, bits=bits, alignment=al, paths=paths, crop=crop, depth=depth)

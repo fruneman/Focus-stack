@@ -2,7 +2,24 @@
 
 Proste narzędzie do focus stackingu zdjęć makro na Linuksa (JPG, TIFF 8/16 bit).
 
-Status: **krok 1 - silnik** (dopasowanie + łączenie). Interfejs graficzny w przygotowaniu.
+## Instalacja (Fedora)
+
+Jednorazowo, w katalogu z programem:
+
+```bash
+./install.sh
+```
+
+Skrypt instaluje pakiety `python3-gobject gtk4 libadwaita python3-opencv python3-numpy python3-pillow`
+i dodaje „Focus Stack” do menu aplikacji GNOME (oraz do „Otwórz za pomocą” dla JPG/TIFF/PNG).
+
+## Obsługa
+
+1. Przeciągnij zdjęcia do okna (lub „Dodaj zdjęcia”).
+2. Kliknij **Połącz**.
+3. Opcjonalnie **retusz**: wybierz na liście klatkę, w której dany fragment jest ostry i bez
+   echa, włącz „Pędzel retuszu” (R) i zamaluj miejsce z echem. Tab przełącza wynik / klatkę.
+4. **Zapisz** (JPG lub TIFF; dla 16-bitowych TIFF-ów domyślnie 16-bitowy TIFF).
 
 ## Jak to działa
 
@@ -18,6 +35,7 @@ Status: **krok 1 - silnik** (dopasowanie + łączenie). Interfejs graficzny w pr
 
 ```bash
 python -m tests.test_quality
+python -m tests.test_retouch
 ```
 
 Generuje syntetyczną serię o znanym wyniku i mierzy dokładność dopasowania oraz jakość.
