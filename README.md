@@ -33,6 +33,9 @@ i trafiają do `main` przez pull request. Numer wersji jest widoczny w menu → 
 2. Kliknij **Połącz**.
 3. Opcjonalnie **retusz**: wybierz na liście klatkę, w której dany fragment jest ostry i bez
    echa, włącz „Pędzel retuszu” (R) i zamaluj miejsce z echem. Tab przełącza wynik / klatkę.
+   Jako **źródło pędzla** można też wybrać wynik drugiej metody (obliczany w tle z tym samym
+   dopasowaniem) – np. połącz mapą głębi (czyste tło, mało szumu), a włoski i czułki domaluj
+   z piramidy.
 4. **Zapisz** (JPG lub TIFF; dla 16-bitowych TIFF-ów domyślnie 16-bitowy TIFF).
 
 ## Jak to działa

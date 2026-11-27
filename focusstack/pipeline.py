@@ -122,3 +122,41 @@ def run(paths: Sequence[str], settings: Settings | None = None,
 
     return Result(image=img, bits=bits, alignment=al, paths=paths, crop=crop, depth=depth,
                   skipped=skipped)
+
+
+METHOD_NAMES = {"pyramid": "piramida", "depthmap": "mapa głębi"}
+
+
+def restack(result: Result, method: str, settings: Settings | None = None,
+            progress: ProgressFn | None = None,
+            cancelled: Callable[[], bool] | None = None) -> np.ndarray:
+    """Łączy te same klatki inną metodą, z TYM SAMYM dopasowaniem i przycięciem co `result`
+    (bez ponownego dopasowywania) - wynik pasuje do pierwszego co do piksela."""
+    settings = settings or Settings()
+    user_progress = progress or (lambda f, m: None)
+
+    def prog(f: float, m: str) -> None:
+        if cancelled is not None and cancelled():
+            raise Cancelled()
+        user_progress(f, m)
+
+    al, paths = result.alignment, result.paths
+
+    def load(i: int) -> np.ndarray:
+        return al.warp(imageio.load(paths[i])[0], i)
+
+    try:
+        if method == "depthmap":
+            img, _ = stack_mod.stack_depthmap(len(paths), load, prog, settings.smoothing)
+        else:
+            img = stack_mod.stack_pyramid(len(paths), load, prog, settings.neighborhood,
+                                          settings.consistency, settings.fine_weight,
+                                          settings.base_sharpness)
+    except (StackError, Cancelled):
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise StackError.unexpected(f"Łączenie metodą: {METHOD_NAMES.get(method, method)}", e) from e
+    if result.crop:
+        x, y, w, h = result.crop
+        img = img[y:y + h, x:x + w]
+    return np.ascontiguousarray(img)
