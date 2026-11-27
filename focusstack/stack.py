@@ -169,37 +169,90 @@ def stack_pyramid(n: int, load: FrameLoader, progress: ProgressFn | None = None,
     return np.clip(_collapse(result), 0.0, 1.0)
 
 
-def stack_depthmap(n: int, load: FrameLoader, progress: ProgressFn | None = None,
-                   smoothing: float = 6.0, contrast: float = 6.0) -> tuple[np.ndarray, np.ndarray]:
-    """Zwraca (obraz, mapa głębi 0..1).
+DEPTH_WORK = 2000   # rozdzielczość mapy głębi (dłuższy bok)
 
-    Każdy piksel to średnia ważona klatek, gdzie waga = (lokalna ostrość) ^ contrast.
-    Gdzie jedna klatka jest wyraźnie najostrzejsza - praktycznie tylko ona się liczy;
-    gdzie żadna nie jest (gładkie, rozmyte tło) - klatki płynnie się uśredniają,
-    więc nie powstają plamy. smoothing - promień oceny ostrości (sigma w pikselach)."""
+
+def estimate_depth(n: int, load: FrameLoader, progress: ProgressFn | None = None,
+                   smoothing: float = 5.0, conf_low: float = 1.5, conf_high: float = 4.0
+                   ) -> tuple[np.ndarray, np.ndarray, tuple[int, int]]:
+    """Mapa głębi (numer klatki, ułamkowy) i pewność 0..1, w zmniejszonej rozdzielczości.
+
+    Ostrość = energia Laplasjanu liczona w PEŁNEJ rozdzielczości i dopiero potem uśredniana
+    do mapy roboczej. Pewność = jak wyraźnie najostrzejsza klatka odstaje od średniej ze
+    POZOSTAŁYCH klatek (gładkie, wszędzie rozmyte tło -> stosunek ~1 -> brak pewności).
+    Porównanie z pozostałymi, a nie ze wszystkimi, sprawia, że miara działa tak samo
+    dla 2 i dla 100 klatek."""
     progress = progress or (lambda f, m: None)
-
-    acc = None
-    wsum = None
-    dsum = None
-    norm = None
+    best = second_idx = idx = total = None
+    full = (0, 0)
     for i in range(n):
-        progress(i / n, f"Łączenie {i + 1}/{n}")
-        img = load(i)
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        progress(i / n, f"Mapa głębi {i + 1}/{n}")
+        gray = cv2.cvtColor(load(i), cv2.COLOR_BGR2GRAY)
+        h, w = gray.shape
+        full = (w, h)
         lap = cv2.Laplacian(cv2.GaussianBlur(gray, (0, 0), 0.8), cv2.CV_32F, ksize=3)
-        sharp = cv2.GaussianBlur(lap * lap, (0, 0), smoothing)
-        if norm is None:
-            norm = float(sharp.mean()) + 1e-12
-            acc = np.zeros_like(img)
-            wsum = np.zeros(gray.shape, np.float32)
-            dsum = np.zeros(gray.shape, np.float32)
-        w = np.minimum(sharp / norm, 1e4) ** contrast + 1e-30
-        acc += img * w[:, :, None]
-        wsum += w
-        dsum += w * i
+        e = cv2.GaussianBlur(lap * lap, (0, 0), smoothing)
+        q = DEPTH_WORK / max(h, w)
+        sw, sh = max(1, round(w * q)), max(1, round(h * q))
+        e = cv2.resize(e, (sw, sh), interpolation=cv2.INTER_AREA)
+        if best is None:
+            best, idx, total = e.copy(), np.zeros((sh, sw), np.float32), e.copy()
+        else:
+            m = e > best
+            best[m] = e[m]
+            idx[m] = i
+            total += e
+    others = (total - best) / max(1, n - 1)
+    ratio = best / (others + 1e-12)
+    conf = np.clip((ratio - conf_low) / (conf_high - conf_low), 0.0, 1.0).astype(np.float32)
 
+    # odszumienie mapy: mała mediana (3x3) usuwa pojedyncze przeskoki, a cienkie
+    # struktury (łodyżki, włoski) szersze niż ~3 px mapy zachowują swoją głębokość
+    d8 = np.round(idx * 255.0 / max(1, n - 1)).astype(np.uint8)
+    d = cv2.medianBlur(d8, 3).astype(np.float32) * max(1, n - 1) / 255.0
+
+    # wypełnianie niepewnych miejsc głębokością z pewnego otoczenia (wieloskalowo)
+    filled = d * conf
+    weight = conf.copy()
+    remaining = 1.0 - conf
+    for sigma in (8, 32, 128):
+        num = cv2.GaussianBlur(d * conf, (0, 0), sigma)
+        den = cv2.GaussianBlur(conf, (0, 0), sigma)
+        cand = num / np.maximum(den, 1e-6)
+        take = remaining * np.clip(den * 4.0, 0.0, 1.0)
+        filled += cand * take
+        weight += take
+        remaining = np.clip(remaining - take, 0.0, 1.0)
+    fallback = float((d * conf).sum() / max(conf.sum(), 1e-6)) if conf.sum() > 0 else (n - 1) / 2
+    depth = (filled + fallback * remaining) / np.maximum(weight + remaining, 1e-6)
+    return depth.astype(np.float32), conf, full
+
+
+def stack_depthmap(n: int, load: FrameLoader, progress: ProgressFn | None = None,
+                   smoothing: float = 5.0) -> tuple[np.ndarray, np.ndarray]:
+    """Odpowiednik DMAP. Zwraca (obraz, mapa głębi 0..1 w pełnej rozdzielczości).
+
+    Każdy piksel pochodzi z klatki, w której jest ostry (bez wzmacniania szumu i kontrastu,
+    wierne kolory); głębokość ułamkowa = płynne przejście między sąsiednimi klatkami."""
+    progress = progress or (lambda f, m: None)
+    depth_small, _, (w, h) = estimate_depth(n, load, lambda f, m: progress(0.5 * f, m),
+                                            smoothing)
+    depth = cv2.resize(depth_small, (w, h), interpolation=cv2.INTER_LINEAR)
+    lo, hi = np.floor(depth.min()), np.ceil(depth.max())
+    acc = None
+    wsum = np.zeros((h, w), np.float32)
+    for i in range(n):
+        progress(0.5 + 0.5 * i / n, f"Składanie {i + 1}/{n}")
+        if i < lo - 1 or i > hi + 1:
+            continue
+        wgt = np.clip(1.0 - np.abs(depth - i), 0.0, 1.0)
+        if not wgt.any():
+            continue
+        img = load(i)
+        if acc is None:
+            acc = np.zeros_like(img)
+        acc += img * wgt[:, :, None]
+        wsum += wgt
     progress(1.0, "Gotowe")
-    out = acc / wsum[:, :, None]
-    depth = dsum / wsum / max(1, n - 1)
-    return np.clip(out, 0.0, 1.0), depth
+    out = acc / np.maximum(wsum, 1e-6)[:, :, None]
+    return np.clip(out, 0.0, 1.0), depth / max(1, n - 1)

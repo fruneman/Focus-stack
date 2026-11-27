@@ -27,8 +27,7 @@ class Settings:
     fine_weight: float = 0.8
     base_sharpness: float = 8.0
     # depthmap
-    smoothing: float = 6.0
-    contrast: float = 6.0
+    smoothing: float = 5.0
 
 
 class Cancelled(Exception):
@@ -107,7 +106,7 @@ def run(paths: Sequence[str], settings: Settings | None = None,
     def do_stack():
         if settings.method == "depthmap":
             return stack_mod.stack_depthmap(len(paths), load, sub(0.3, 1.0),
-                                            settings.smoothing, settings.contrast)
+                                            settings.smoothing)
         return stack_mod.stack_pyramid(len(paths), load, sub(0.3, 1.0), settings.neighborhood,
                                        settings.consistency, settings.fine_weight,
                                        settings.base_sharpness), None

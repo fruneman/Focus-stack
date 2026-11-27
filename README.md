@@ -47,7 +47,11 @@ i trafiają do `main` przez pull request. Numer wersji jest widoczny w menu → 
 2. **Łączenie (stack)**
    - `pyramid` - odpowiednik PMax z redukcją echa (ocena ostrości w otoczeniu piksela,
      decyzje drobnych warstw wpływają na grubsze, filtr spójności),
-   - `depthmap` - odpowiednik DMAP (mapa głębi z płynnymi przejściami) - w przebudowie.
+   - `depthmap` - odpowiednik DMAP: dla każdego miejsca wybiera klatkę, w której jest ostre
+     (pewność oceny = jak bardzo najostrzejsza klatka odstaje od pozostałych; niepewne miejsca
+     dostają głębokość z otoczenia). Nie wzmacnia szumu ani kontrastu, wierne kolory - dobra do
+     wysokiego ISO, gładkich i błyszczących powierzchni, długich serii; słabsza tam, gdzie cienkie
+     struktury nakładają się na tło z innej głębokości.
 
 ## Testy
 

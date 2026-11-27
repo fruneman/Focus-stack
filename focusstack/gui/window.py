@@ -596,7 +596,7 @@ class MainWindow(Adw.ApplicationWindow):
     # =====================================================================
     def _on_method_changed(self, row, _pspec) -> None:
         subtitles = ["Piramida - zalecana dla włosków i drobnych struktur",
-                     "Mapa głębi - gładsze tła, mniej szumu"]
+                     "Mapa głębi - wierne kolory, mniej szumu; słabsza przy włoskach"]
         row.set_subtitle(subtitles[row.get_selected()])
 
     def _collect_settings(self) -> pipeline.Settings:
