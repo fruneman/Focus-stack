@@ -36,6 +36,8 @@ i trafiają do `main` przez pull request. Numer wersji jest widoczny w menu → 
    Jako **źródło pędzla** można też wybrać wynik drugiej metody (obliczany w tle z tym samym
    dopasowaniem) – np. połącz mapą głębi (czyste tło, mało szumu), a włoski i czułki domaluj
    z piramidy.
+   **Podgląd pod pędzlem** (klawisz P) pokazuje we wnętrzu pędzla, co zostanie wklejone –
+   z tym samym miękkim brzegiem – zanim zaczniesz malować.
 4. **Zapisz** (JPG lub TIFF; dla 16-bitowych TIFF-ów domyślnie 16-bitowy TIFF).
 
 ## Jak to działa

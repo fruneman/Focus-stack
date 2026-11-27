@@ -4,10 +4,14 @@ from __future__ import annotations
 
 from typing import Callable
 
+import threading
+
 import cairo
 import cv2
 import numpy as np
-from gi.repository import Gdk, Gtk
+from gi.repository import Gdk, GLib, Gtk
+
+from ..retouch import Retoucher
 
 MIN_MIP_SIDE = 400
 
@@ -70,6 +74,12 @@ class ImageViewer(Gtk.DrawingArea):
         self.paint_mode = False
         self.brush_radius = 40.0  # w pikselach obrazu
         self._cursor: tuple[float, float] | None = None
+        # podgląd źródła pod pędzlem
+        self.brush_preview = True
+        self.brush_hardness = 0.3
+        self._src: _Mips | None = None
+        self._src_key = None
+        self._src_gen = 0
         self._pan_start: tuple[float, float] | None = None
         self._painting = False
         self.on_paint: Callable[[str, float, float], None] | None = None  # "begin"/"move"/"end"
@@ -109,6 +119,33 @@ class ImageViewer(Gtk.DrawingArea):
             self._mips.update(img, box)
             self.queue_draw()
 
+    def set_brush_source(self, key, img: np.ndarray | None) -> None:
+        """Obraz pokazywany pod pędzlem (klatka lub wynik drugiej metody).
+        Pomniejszenia budowane są w tle; `key` pozwala nie budować ich ponownie."""
+        if img is None:
+            self._src_gen += 1
+            self._src, self._src_key = None, None
+            self.queue_draw()
+            return
+        if key == self._src_key and self._src is not None:
+            return
+        self._src_gen += 1
+        gen = self._src_gen
+        self._src_key = key
+        self._src = None
+
+        def work():
+            mips = _Mips(img)
+            GLib.idle_add(self._src_ready, gen, mips)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _src_ready(self, gen, mips):
+        if gen == self._src_gen:
+            self._src = mips
+            self.queue_draw()
+        return False
+
     @property
     def has_image(self) -> bool:
         return self._mips is not None
@@ -146,29 +183,46 @@ class ImageViewer(Gtk.DrawingArea):
         return self.ox + x / self.scale, self.oy + y / self.scale
 
     # --- rysowanie -------------------------------------------------------------
-    def _draw(self, area, cr: cairo.Context, width: int, height: int) -> None:
-        if not self._mips:
-            return
+    def _paint_mips(self, cr: cairo.Context, mips: _Mips) -> None:
         dev = self.get_scale_factor()
         eff = self.scale * dev
         level = 0
-        while level + 1 < len(self._mips.levels) and eff <= 0.5 ** (level + 1):
+        while level + 1 < len(mips.levels) and eff <= 0.5 ** (level + 1):
             level += 1
         s_l = 0.5 ** level
         cr.save()
         cr.translate(-self.ox * self.scale, -self.oy * self.scale)
         cr.scale(self.scale / s_l, self.scale / s_l)
-        cr.set_source_surface(self._mips.surfaces[level], 0, 0)
+        cr.set_source_surface(mips.surfaces[level], 0, 0)
         pattern = cr.get_source()
         pattern.set_filter(cairo.FILTER_NEAREST if eff / s_l >= 2.0 else cairo.FILTER_GOOD)
-        w, h = self._mips.levels[level].shape[1], self._mips.levels[level].shape[0]
+        w, h = mips.levels[level].shape[1], mips.levels[level].shape[0]
         cr.rectangle(0, 0, w, h)
         cr.fill()
         cr.restore()
 
+    def _draw(self, area, cr: cairo.Context, width: int, height: int) -> None:
+        if not self._mips:
+            return
+        self._paint_mips(cr, self._mips)
+
         if self.paint_mode and self._cursor:
             x, y = self._cursor
             r = self.brush_radius * self.scale
+            if self.brush_preview and self._src is not None and self._src.size == self._mips.size:
+                # źródło widoczne przez maskę o profilu pędzla = dokładnie to, co zostanie wklejone
+                cr.save()
+                cr.rectangle(x - r - 1, y - r - 1, 2 * r + 2, 2 * r + 2)
+                cr.clip()
+                cr.push_group()
+                self._paint_mips(cr, self._src)
+                cr.pop_group_to_source()
+                grad = cairo.RadialGradient(x, y, 0, x, y, max(r, 1.0))
+                for d in np.linspace(0.0, 1.0, 13):
+                    a = float(Retoucher.brush_mask(np.array([d], np.float32), self.brush_hardness)[0])
+                    grad.add_color_stop_rgba(float(d), 0, 0, 0, a)
+                cr.mask(grad)
+                cr.restore()
             cr.set_line_width(1.5)
             cr.arc(x, y, r, 0, 2 * np.pi)
             cr.set_source_rgba(0, 0, 0, 0.8)

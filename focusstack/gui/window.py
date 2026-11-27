@@ -179,6 +179,13 @@ class MainWindow(Adw.ApplicationWindow):
         hard_scale.set_size_request(120, -1)
         hard_row.add_suffix(hard_scale)
         self.retouch_group.add(hard_row)
+        self.hard_adj.connect("value-changed", self._on_hardness_changed)
+
+        self.preview_row = Adw.SwitchRow(
+            title="Podgląd pod pędzlem", active=True,
+            subtitle="Wnętrze pędzla pokazuje, co zostanie wklejone. Skrót: P")
+        self.preview_row.connect("notify::active", self._on_preview_toggled)
+        self.retouch_group.add(self.preview_row)
 
         undo_box = Gtk.Box(spacing=6, homogeneous=True, margin_top=12)
         for label, icon, action, tip in (("Cofnij", "edit-undo-symbolic", "win.undo", "Ctrl+Z"),
@@ -309,6 +316,8 @@ class MainWindow(Adw.ApplicationWindow):
             "toggle-retouch": (lambda *_: self.retouch_row.set_active(
                 not self.retouch_row.get_active()), ["r"]),
             "toggle-view": (self._toggle_view, ["Tab"]),
+            "toggle-preview": (lambda *_: self.preview_row.set_active(
+                not self.preview_row.get_active()), ["p"]),
             "brush-smaller": (lambda *_: self.brush_adj.set_value(self.brush_adj.get_value() / 1.2),
                               ["bracketleft"]),
             "brush-bigger": (lambda *_: self.brush_adj.set_value(self.brush_adj.get_value() * 1.2),
@@ -339,6 +348,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._actions["undo"].set_enabled(bool(self.retoucher and self.retoucher.can_undo) and not busy)
         self._actions["redo"].set_enabled(bool(self.retoucher and self.retoucher.can_redo) and not busy)
         self._actions["toggle-retouch"].set_enabled(has_result and not busy)
+        self._actions["toggle-preview"].set_enabled(has_result and not busy)
         self.retouch_group.set_sensitive(has_result and not busy)
         self.view_box.set_visible(has_result)
         self.view_frame_btn.set_sensitive(self.selected is not None or self._alt_source())
@@ -507,6 +517,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._reset_alt()
         self.result = None
         self.retoucher = None
+        self.viewer.set_brush_source(None, None)
         self.dirty = False
         self.retouch_row.set_active(False)
         self._showing = "frame"
@@ -576,6 +587,7 @@ class MainWindow(Adw.ApplicationWindow):
         if r.has_frame(idx):
             if show:
                 self.viewer.set_image(r.frame(idx))
+            self._refresh_brush_source()
             return
         self._toast(f"Wczytywanie klatki {idx + 1}…", timeout=1)
 
@@ -586,6 +598,7 @@ class MainWindow(Adw.ApplicationWindow):
                 except Exception as e:  # noqa: BLE001
                     GLib.idle_add(self._show_error, e, "Wczytywanie klatki do retuszu")
                     return
+            GLib.idle_add(self._refresh_brush_source)
             if show:
                 GLib.idle_add(self._show_after_preload, idx)
 
@@ -704,6 +717,7 @@ class MainWindow(Adw.ApplicationWindow):
                 return load_for_gui(i)
 
             self._reset_alt()
+            self.viewer.set_brush_source(None, None)
             self.retoucher = Retoucher(res.image, load_source, cache_size=3)
             other = "depthmap" if self._result_method == "pyramid" else "pyramid"
             self._alt_name = pipeline.METHOD_NAMES[other]
@@ -772,6 +786,7 @@ class MainWindow(Adw.ApplicationWindow):
             self._preload_frame(self.selected)
             self._toast(f"Retusz z klatki {self.selected + 1}: "
                         f"{os.path.basename(self.paths[self.selected])}")
+        self._refresh_brush_source()
         self.viewer.queue_draw()
         self._update_state()
 
@@ -799,6 +814,7 @@ class MainWindow(Adw.ApplicationWindow):
             row.set_subtitle("Klatka zaznaczona na liście")
         if self._showing == "frame":
             self._show_frame()
+        self._refresh_brush_source()
         self._update_state()
 
     def _start_alt(self) -> None:
@@ -845,6 +861,29 @@ class MainWindow(Adw.ApplicationWindow):
         self._toast(f"Wynik: {self._alt_name} – gotowy do retuszu")
         if self._showing == "frame" and self._alt_source():
             self._show_frame()
+        self._refresh_brush_source()
+        return False
+
+    # --- podgląd pod pędzlem ---------------------------------------------------
+    def _on_preview_toggled(self, row, _pspec) -> None:
+        self.viewer.brush_preview = row.get_active()
+        self.viewer.queue_draw()
+
+    def _on_hardness_changed(self, adj) -> None:
+        self.viewer.brush_hardness = adj.get_value()
+        self.viewer.queue_draw()
+
+    def _refresh_brush_source(self) -> bool:
+        """Przekazuje do podglądu aktualne źródło pędzla (jeśli jest już wczytane)."""
+        r = self.retoucher
+        img, key = None, None
+        if r is not None and self.retouch_row.get_active():
+            if self._alt_source():
+                img, key = self.alt_image, ("alt", self._alt_token)
+            elif self.selected is not None and not self._is_skipped(self.selected) \
+                    and r.has_frame(self.selected):
+                img, key = r.frame(self.selected), ("frame", id(self.result), self.selected)
+        self.viewer.set_brush_source(key, img)
         return False
 
     def _on_brush_changed(self, adj) -> None:
@@ -979,7 +1018,7 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _on_shortcuts(self, *_):
         rows = [("Ctrl+O", "Dodaj zdjęcia"), ("Ctrl+Enter", "Połącz"), ("Ctrl+S", "Zapisz"),
-                ("Tab", "Przełącz: wynik / wybrana klatka"), ("R", "Pędzel retuszu wł./wył."),
+                ("Tab", "Przełącz: wynik / wybrana klatka"), ("R", "Pędzel retuszu wł./wył."), ("P", "Podgląd pod pędzlem wł./wył."),
                 ("[  ]", "Mniejszy / większy pędzel"), ("Ctrl+kółko", "Rozmiar pędzla"),
                 ("Ctrl+Z / Ctrl+Shift+Z", "Cofnij / ponów"), ("Kółko myszy", "Powiększenie"),
                 ("Prawy przycisk + przeciąganie", "Przesuwanie obrazu"),
