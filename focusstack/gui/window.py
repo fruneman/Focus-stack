@@ -129,6 +129,12 @@ class MainWindow(Adw.ApplicationWindow):
         self.align_row = Adw.SwitchRow(title="Dopasuj zdjęcia", active=True,
                                        subtitle="Wyłącz tylko dla zdjęć ze statywu i szyny")
         sg.add(self.align_row)
+        self.local_row = Adw.SwitchRow(
+            title="Korekta paralaksy", active=True,
+            subtitle="Zgrywa obiekty na różnej głębokości – mniej ech przy zdjęciach z ręki")
+        self.align_row.bind_property("active", self.local_row, "sensitive",
+                                     GObject.BindingFlags.SYNC_CREATE)
+        sg.add(self.local_row)
         self.crop_row = Adw.SwitchRow(title="Przytnij brzegi", active=True,
                                       subtitle="Usuwa krawędzie, których nie pokrywają wszystkie klatki")
         sg.add(self.crop_row)
@@ -597,6 +603,7 @@ class MainWindow(Adw.ApplicationWindow):
         s = pipeline.Settings()
         s.method = METHODS[self.method_row.get_selected()][0]
         s.do_align = self.align_row.get_active()
+        s.local_align = s.do_align and self.local_row.get_active()
         s.crop = self.crop_row.get_active()
         return s
 

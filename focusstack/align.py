@@ -39,19 +39,36 @@ class Alignment:
     crop: tuple[int, int, int, int] | None = None          # x, y, w, h wspólnego obszaru
     warnings: list[str] = field(default_factory=list)
     failed: list[int] = field(default_factory=list)       # klatki, których nie dopasowano
+    # lokalne odkształcenie (korekta paralaksy): pole przesunięć w małej rozdzielczości,
+    # w pikselach pełnej rozdzielczości, w układzie klatki odniesienia; None = brak
+    flows: list[np.ndarray | None] = field(default_factory=list)
 
     def subset(self, keep: Sequence[int]) -> "Alignment":
         """Dopasowanie ograniczone do wybranych klatek (np. bez nieudanych)."""
         return Alignment(size=self.size, ref_index=list(keep).index(self.ref_index),
                          matrices=[self.matrices[i] for i in keep],
                          gains=[self.gains[i] for i in keep] if self.gains else [],
-                         crop=self.crop, warnings=self.warnings, failed=[])
+                         crop=self.crop, warnings=self.warnings, failed=[],
+                         flows=[self.flows[i] for i in keep] if self.flows else [])
 
     def warp(self, img: np.ndarray, index: int) -> np.ndarray:
         w, h = self.size
         m = self.matrices[index][:2]
-        out = cv2.warpAffine(img, m, (w, h), flags=cv2.INTER_CUBIC | cv2.WARP_INVERSE_MAP,
-                             borderMode=cv2.BORDER_REFLECT)
+        flow = self.flows[index] if self.flows else None
+        if flow is None:
+            out = cv2.warpAffine(img, m, (w, h), flags=cv2.INTER_CUBIC | cv2.WARP_INVERSE_MAP,
+                                 borderMode=cv2.BORDER_REFLECT)
+        else:
+            # jedno przepróbkowanie: punkt x układu odniesienia -> M·(x + f(x)) w klatce
+            f = cv2.resize(flow.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
+            xx, yy = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
+            xx += f[..., 0]
+            yy += f[..., 1]
+            del f
+            mx = (m[0, 0] * xx + m[0, 1] * yy + m[0, 2]).astype(np.float32)
+            my = (m[1, 0] * xx + m[1, 1] * yy + m[1, 2]).astype(np.float32)
+            del xx, yy
+            out = cv2.remap(img, mx, my, cv2.INTER_CUBIC, borderMode=cv2.BORDER_REFLECT)
         if self.gains:
             out *= self.gains[index][None, None, :]
         return out
@@ -133,6 +150,26 @@ def _resize(g: np.ndarray, size: int) -> np.ndarray:
     return cv2.resize(g, (max(1, round(w * s)), max(1, round(h * s))), interpolation=cv2.INTER_AREA)
 
 
+def _detail_mask(a: np.ndarray, b: np.ndarray, m: np.ndarray) -> np.ndarray | None:
+    """Maska (w układzie obrazu A) obszarów z wyraźnymi szczegółami w A lub w B."""
+    h, w = a.shape
+    bw = cv2.warpAffine(b, m, (w, h), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+                        borderMode=cv2.BORDER_REFLECT)
+
+    def detail(g):
+        gx = cv2.Sobel(g, cv2.CV_32F, 1, 0)
+        gy = cv2.Sobel(g, cv2.CV_32F, 0, 1)
+        return cv2.GaussianBlur(np.sqrt(gx * gx + gy * gy), (0, 0), 2)
+
+    d = np.maximum(detail(a), detail(bw))
+    thr = np.percentile(d, 92)
+    mask = (d > thr).astype(np.uint8)
+    mask = cv2.dilate(mask, np.ones((9, 9), np.uint8))
+    if mask.mean() < 0.02:  # za mało, by dopasowanie było wiarygodne
+        return None
+    return mask * 255
+
+
 def _coarse_to_fine(a: np.ndarray, b: np.ndarray):
     """Metoda zapasowa dla klatek o bardzo różnej ostrości (SIFT nie znajduje wspólnych
     punktów): porównanie całych, rozmytych kształtów jasności. Najpierw zgrubne
@@ -161,10 +198,19 @@ def _coarse_to_fine(a: np.ndarray, b: np.ndarray):
         prev = size
         af = cv2.GaussianBlur(_resize(a, size), (0, 0), sig).astype(np.float32)
         bf = cv2.GaussianBlur(_resize(b, size), (0, 0), sig).astype(np.float32)
+        # Na dużych rozdzielczościach porównujemy tylko obszary z wyraźnymi szczegółami:
+        # rozmyte tło przesuwa się inaczej niż ostry obiekt (paralaksa) i "ciągnęłoby"
+        # dopasowanie w swoją stronę.
+        mask = _detail_mask(af, bf, m) if size >= 1200 else None
         try:
-            cc, m = cv2.findTransformECC(af, bf, m, cv2.MOTION_AFFINE, criteria, None, 5)
+            cc, m = cv2.findTransformECC(af, bf, m, cv2.MOTION_AFFINE, criteria, mask, 5)
         except cv2.error:
-            return None, 0.0
+            if mask is None:
+                return None, 0.0
+            try:  # za mało szczegółów w masce - próbujemy na całym kadrze
+                cc, m = cv2.findTransformECC(af, bf, m, cv2.MOTION_AFFINE, criteria, None, 5)
+            except cv2.error:
+                return None, 0.0
         if size == work:
             break
     m = _to_similarity(m)
@@ -204,6 +250,36 @@ def _estimate_pair(feat: _Features, ia: int, a: np.ndarray, ib: int, b: np.ndarr
                   "ostrości lub kadru)")
 
 
+FLOW_SIZE = 1000      # rozdzielczość liczenia przepływu (dłuższy bok)
+
+
+def _local_flow(ref: np.ndarray, mov: np.ndarray) -> np.ndarray:
+    """Gładkie pole lokalnych przesunięć: ref(x) ≈ mov(x + f(x)), w pikselach tej skali.
+
+    Przepływ optyczny (DIS) liczony na lekko rozmytych obrazach, uśredniany z wagą
+    "ilości szczegółów" i mocno wygładzany - dopuszczamy tylko płynne odkształcenia
+    (różne przesunięcie obiektów na różnej głębokości), nie drobne "falowanie".
+    Tam, gdzie nie ma szczegółów (gładkie tło), odkształcenie wygasa do zera."""
+    a = cv2.GaussianBlur(ref, (0, 0), 2.0)
+    b = cv2.GaussianBlur(mov, (0, 0), 2.0)
+    dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
+    f = dis.calc(np.clip(a * 255, 0, 255).astype(np.uint8),
+                 np.clip(b * 255, 0, 255).astype(np.uint8), None)
+    gm = np.maximum(a, b)
+    gx = cv2.Sobel(gm, cv2.CV_32F, 1, 0)
+    gy = cv2.Sobel(gm, cv2.CV_32F, 0, 1)
+    wgt = cv2.GaussianBlur(np.sqrt(gx * gx + gy * gy), (0, 0), 2)
+    smooth = 0.02 * max(ref.shape)
+    wsum = cv2.GaussianBlur(wgt, (0, 0), smooth) + 1e-6
+    out = np.dstack([cv2.GaussianBlur(f[..., k] * wgt, (0, 0), smooth) / wsum for k in range(2)])
+    conf = np.clip(wsum / (2.0 * float(np.median(wsum)) + 1e-6), 0.0, 1.0)
+    out *= conf[..., None]
+    limit = 0.03 * max(ref.shape)
+    mag = np.hypot(out[..., 0], out[..., 1])
+    out *= np.minimum(1.0, limit / np.maximum(mag, 1e-6))[..., None]
+    return out.astype(np.float32)
+
+
 def _gain(ref: np.ndarray, img: np.ndarray) -> np.ndarray:
     """Mnożniki BGR wyrównujące średnią jasność do klatki odniesienia (środek kadru)."""
     h, w = ref.shape[:2]
@@ -235,7 +311,7 @@ def _common_crop(matrices: Sequence[np.ndarray], size: tuple[int, int]) -> tuple
 
 
 def align(paths: Sequence[str], work_size: int = 2000,
-          progress: ProgressFn | None = None) -> Alignment:
+          progress: ProgressFn | None = None, local: bool = False) -> Alignment:
     n = len(paths)
     if n == 0:
         raise StackError("Brak zdjęć", "Lista zdjęć jest pusta.", ["Dodaj zdjęcia serii."])
@@ -344,11 +420,55 @@ def align(paths: Sequence[str], work_size: int = 2000,
                              borderMode=cv2.BORDER_REFLECT)
         gains.append(_gain(thumbs[ref], img))
 
+    flows: list[np.ndarray | None] = []
+    if local:
+        progress(0.95, "Korekta paralaksy")
+        flows = _parallax_flows(smalls, small_m, ref, failed, full_size)
+
     result = Alignment(size=full_size, ref_index=ref, matrices=matrices, gains=gains,
-                       warnings=warnings, failed=sorted(failed))
+                       warnings=warnings, failed=sorted(failed), flows=flows)
     result.crop = _common_crop([matrices[i] for i in ok_idx], full_size)
     progress(1.0, "Dopasowanie zakończone")
     return result
+
+
+def _parallax_flows(smalls: list[np.ndarray], small_m: list[np.ndarray], ref: int,
+                    failed: list[int], full_size: tuple[int, int]) -> list[np.ndarray | None]:
+    """Lokalne odkształcenia klatek względem klatki odniesienia (łańcuchowo, od sąsiada
+    do sąsiada - sąsiednie klatki mają podobną ostrość, więc przepływ jest pewniejszy)."""
+    n = len(smalls)
+    h, w = smalls[0].shape
+    q = FLOW_SIZE / max(h, w)
+    fw, fh = round(w * q), round(h * q)
+    qm, qm_inv = np.diag([q, q, 1.0]), np.diag([1 / q, 1 / q, 1.0])
+
+    def aligned(i):
+        m = qm @ small_m[i] @ qm_inv
+        g = cv2.resize(smalls[i], (fw, fh), interpolation=cv2.INTER_AREA)
+        return cv2.warpAffine(g, m[:2], (fw, fh), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+                              borderMode=cv2.BORDER_REFLECT)
+
+    xx, yy = np.meshgrid(np.arange(fw, dtype=np.float32), np.arange(fh, dtype=np.float32))
+    to_full = full_size[0] / fw
+    flows: list[np.ndarray | None] = [None] * n
+    flows[ref] = np.zeros((fh, fw, 2), np.float32)
+    ref_img = aligned(ref)
+    for direction in (1, -1):
+        prev_final = ref_img
+        b = ref + direction
+        while 0 <= b < n:
+            if b not in failed:
+                g = aligned(b)
+                f = _local_flow(prev_final, g)      # w pikselach skali przepływu
+                prev_final = cv2.remap(g, xx + f[..., 0], yy + f[..., 1], cv2.INTER_LINEAR,
+                                       borderMode=cv2.BORDER_REFLECT)
+                flows[b] = f * to_full
+            b += direction
+    for i in range(n):
+        if flows[i] is not None:
+            flows[i] = flows[i].astype(np.float16)  # oszczędność pamięci
+    flows[ref] = None
+    return flows
 
 
 def identity(paths: Sequence[str]) -> Alignment:

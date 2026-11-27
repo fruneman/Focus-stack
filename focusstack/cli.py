@@ -17,11 +17,13 @@ def main() -> int:
     ap.add_argument("--method", choices=["pyramid", "depthmap"], default="pyramid")
     ap.add_argument("--no-align", action="store_true")
     ap.add_argument("--no-crop", action="store_true")
+    ap.add_argument("--no-local", action="store_true", help="bez korekty paralaksy")
     ap.add_argument("--consistency", type=int, default=5)
     ap.add_argument("--fine-weight", type=float, default=0.8)
     a = ap.parse_args()
 
     s = pipeline.Settings(method=a.method, do_align=not a.no_align, crop=not a.no_crop,
+                          local_align=not a.no_local,
                           consistency=a.consistency, fine_weight=a.fine_weight)
     t0 = time.time()
     last = [-1]

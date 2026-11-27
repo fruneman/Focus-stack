@@ -19,6 +19,7 @@ ProgressFn = Callable[[float, str], None]
 class Settings:
     method: str = "pyramid"        # "pyramid" (PMax+) lub "depthmap" (DMAP)
     do_align: bool = True
+    local_align: bool = True       # korekta paralaksy (lokalne odkształcenie klatek)
     crop: bool = True              # przytnij do obszaru wspólnego dla wszystkich klatek
     # pyramid
     neighborhood: float = 1.5
@@ -84,7 +85,8 @@ def run(paths: Sequence[str], settings: Settings | None = None,
 
     if settings.do_align:
         al = stage("Wczytywanie i dopasowanie zdjęć",
-                   lambda: align_mod.align(paths, progress=sub(0.0, 0.3)))
+                   lambda: align_mod.align(paths, progress=sub(0.0, 0.3),
+                                           local=settings.local_align))
     else:
         al = stage("Wczytywanie zdjęć", lambda: align_mod.identity(paths))
 

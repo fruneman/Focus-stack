@@ -26,6 +26,10 @@ i dodaje „Focus Stack” do menu aplikacji GNOME (oraz do „Otwórz za pomoc�
 1. **Dopasowanie (align)** - klatki są dopasowywane parami do sąsiadów (SIFT + RANSAC,
    potem dokładne ECC), z korekcją przesunięcia, obrotu i skali ("oddychanie" obiektywu)
    oraz wyrównaniem jasności. Wynik jest przycinany do obszaru wspólnego dla wszystkich klatek.
+   Gdy punkty charakterystyczne zawodzą (bardzo różna ostrość sąsiednich klatek), używana jest
+   metoda zapasowa: dopasowanie rozmytych kształtów + ECC ograniczone do obszarów ze szczegółami.
+   **Korekta paralaksy**: po dopasowaniu globalnym gładki przepływ optyczny lokalnie zgrywa
+   obiekty leżące na różnej głębokości (główne źródło ech przy zdjęciach z ręki).
 2. **Łączenie (stack)**
    - `pyramid` - odpowiednik PMax z redukcją echa (ocena ostrości w otoczeniu piksela,
      decyzje drobnych warstw wpływają na grubsze, filtr spójności),
