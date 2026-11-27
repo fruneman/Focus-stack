@@ -16,6 +16,7 @@ from ..retouch import Retoucher
 from .viewer import ImageViewer
 
 THUMB = 72
+ALT = -1   # "numer klatki" oznaczający wynik drugiej metody jako źródło pędzla
 METHODS = [("pyramid", "Piramida"),
            ("depthmap", "Mapa głębi")]
 
@@ -72,6 +73,12 @@ class MainWindow(Adw.ApplicationWindow):
         self._last_paint: tuple[float, float] | None = None
         self._showing = "result"
         self._lock = threading.Lock()
+        self._result_method = "pyramid"
+        self._alt_name = "mapa głębi"
+        self._result_settings = pipeline.Settings()
+        self.alt_image = None          # wynik drugiej metody (źródło pędzla)
+        self._alt_token = 0            # zmiana unieważnia trwające obliczenia
+        self._alt_running = False
 
         self._build_ui()
         self._setup_actions()
@@ -149,6 +156,12 @@ class MainWindow(Adw.ApplicationWindow):
                                          subtitle="Skrót: R. Przesuwanie: prawy przycisk myszy")
         self.retouch_row.connect("notify::active", self._on_retouch_toggled)
         self.retouch_group.add(self.retouch_row)
+
+        self.source_row = Adw.ComboRow(title="Źródło pędzla",
+                                       model=Gtk.StringList.new(["Klatka", "Wynik"]))
+        self.source_row.set_subtitle("Klatka zaznaczona na liście albo wynik drugiej metody")
+        self.source_row.connect("notify::selected", self._on_source_changed)
+        self.retouch_group.add(self.source_row)
 
         brush_row = Adw.ActionRow(title="Rozmiar pędzla", subtitle="Ctrl + kółko myszy, [ ]")
         self.brush_adj = Gtk.Adjustment(value=40, lower=2, upper=600, step_increment=1)
@@ -328,13 +341,14 @@ class MainWindow(Adw.ApplicationWindow):
         self._actions["toggle-retouch"].set_enabled(has_result and not busy)
         self.retouch_group.set_sensitive(has_result and not busy)
         self.view_box.set_visible(has_result)
-        self.view_frame_btn.set_sensitive(self.selected is not None)
+        self.view_frame_btn.set_sensitive(self.selected is not None or self._alt_source())
         self.content_stack.set_visible_child_name("viewer" if has_files else "empty")
         self.frames_group.set_sensitive(not busy)
         n = len(self.paths)
         self.frames_group.set_title(f"Klatki ({n})" if n else "Klatki")
         for i, row in enumerate(self.rows):
-            row.badge.set_visible(has_result and self.retouch_row.get_active() and i == self.selected)
+            row.badge.set_visible(has_result and self.retouch_row.get_active()
+                                  and i == self.selected and not self._alt_source())
         title = "Focus Stack"
         if self.dirty:
             title = "• " + title
@@ -490,6 +504,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._update_state()
 
     def _invalidate_result(self) -> None:
+        self._reset_alt()
         self.result = None
         self.retoucher = None
         self.dirty = False
@@ -500,6 +515,8 @@ class MainWindow(Adw.ApplicationWindow):
     # Wybór klatki i podgląd
     # =====================================================================
     def _on_row_activated(self, listbox, row) -> None:
+        if self._alt_source():
+            self.source_row.set_selected(0)  # kliknięcie klatki = klatka jako źródło
         self._select(self.rows.index(row))
         if self.result is not None and not self.retouch_row.get_active():
             self.view_frame_btn.set_active(True)
@@ -516,6 +533,12 @@ class MainWindow(Adw.ApplicationWindow):
             self._preload_frame(idx)
 
     def _show_frame(self) -> None:
+        if self._alt_source():
+            if self.alt_image is not None:
+                self.viewer.set_image(self.alt_image)
+            else:
+                self._toast("Wynik drugiej metody jeszcze się oblicza")
+            return
         if self.selected is None:
             return
         idx = self.selected
@@ -596,7 +619,7 @@ class MainWindow(Adw.ApplicationWindow):
     # =====================================================================
     def _on_method_changed(self, row, _pspec) -> None:
         subtitles = ["Piramida - zalecana dla włosków i drobnych struktur",
-                     "Mapa głębi - gładsze tła, mniej szumu"]
+                     "Mapa głębi - wierne kolory, mniej szumu; słabsza przy włoskach"]
         row.set_subtitle(subtitles[row.get_selected()])
 
     def _collect_settings(self) -> pipeline.Settings:
@@ -620,6 +643,9 @@ class MainWindow(Adw.ApplicationWindow):
     def _start_stack(self):
         paths = list(self.paths)
         settings = self._collect_settings()
+        self._result_method = settings.method
+        self._result_settings = settings
+        self._reset_alt()
         self._busy = True
         self._cancel = False
         self.retouch_row.set_active(False)
@@ -668,7 +694,22 @@ class MainWindow(Adw.ApplicationWindow):
                 # numer klatki na liście w oknie -> numer wśród faktycznie połączonych klatek
                 return res.frame(res.paths.index(gui_paths[i]))
 
-            self.retoucher = Retoucher(res.image, load_for_gui)
+            def load_source(i: int):
+                if i == ALT:
+                    if self.alt_image is None:
+                        raise StackError("Wynik drugiej metody nie jest gotowy",
+                                         "Obliczenia jeszcze trwają.",
+                                         ["Poczekaj, aż w panelu Retusz pojawi się „gotowy”."])
+                    return self.alt_image
+                return load_for_gui(i)
+
+            self._reset_alt()
+            self.retoucher = Retoucher(res.image, load_source, cache_size=3)
+            other = "depthmap" if self._result_method == "pyramid" else "pyramid"
+            self._alt_name = pipeline.METHOD_NAMES[other]
+            self.source_row.set_model(Gtk.StringList.new(
+                ["Klatka", self._alt_name.capitalize()]))
+            self.source_row.set_selected(0)
             self.dirty = True
             self._showing = "result"
             self.view_result_btn.set_active(True)
@@ -734,17 +775,97 @@ class MainWindow(Adw.ApplicationWindow):
         self.viewer.queue_draw()
         self._update_state()
 
+    # --- źródło pędzla: wynik drugiej metody ---------------------------------
+    def _alt_source(self) -> bool:
+        return self.retoucher is not None and self.source_row.get_selected() == 1
+
+    def _reset_alt(self) -> None:
+        self._alt_token += 1          # unieważnia trwające obliczenia
+        self._alt_running = False
+        self.alt_image = None
+        if hasattr(self, "source_row"):
+            self.source_row.set_selected(0)
+
+    def _on_source_changed(self, row, _pspec) -> None:
+        alt = self._alt_source()
+        if alt:
+            self.view_frame_btn.set_label(f"Wynik: {self._alt_name}")
+            if self.alt_image is None and not self._alt_running:
+                self._start_alt()
+            elif self.alt_image is not None:
+                row.set_subtitle("Gotowy – zamaluj miejsca, które mają pochodzić z tego wyniku")
+        else:
+            self.view_frame_btn.set_label("Wybrana klatka")
+            row.set_subtitle("Klatka zaznaczona na liście")
+        if self._showing == "frame":
+            self._show_frame()
+        self._update_state()
+
+    def _start_alt(self) -> None:
+        res = self.result
+        if res is None:
+            return
+        method = "depthmap" if self._result_method == "pyramid" else "pyramid"
+        settings = self._result_settings
+        token = self._alt_token
+        self._alt_running = True
+        self.source_row.set_subtitle("Obliczanie… 0%")
+
+        def progress(f, _msg):
+            GLib.idle_add(self._alt_progress, token, f)
+
+        def work():
+            try:
+                img = pipeline.restack(res, method, settings, progress,
+                                       lambda: token != self._alt_token)
+            except pipeline.Cancelled:
+                return
+            except Exception as e:  # noqa: BLE001
+                GLib.idle_add(self._alt_done, token, None, e)
+                return
+            GLib.idle_add(self._alt_done, token, img, None)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _alt_progress(self, token, f):
+        if token == self._alt_token and self._alt_running:
+            self.source_row.set_subtitle(f"Obliczanie… {round(f * 100)}% (okno działa normalnie)")
+        return False
+
+    def _alt_done(self, token, img, error):
+        if token != self._alt_token:
+            return False
+        self._alt_running = False
+        if error is not None:
+            self.source_row.set_subtitle("Nie udało się obliczyć")
+            self._show_error(error, "Łączenie drugą metodą")
+            return False
+        self.alt_image = img
+        self.source_row.set_subtitle("Gotowy – zamaluj miejsca, które mają pochodzić z tego wyniku")
+        self._toast(f"Wynik: {self._alt_name} – gotowy do retuszu")
+        if self._showing == "frame" and self._alt_source():
+            self._show_frame()
+        return False
+
     def _on_brush_changed(self, adj) -> None:
         self.viewer.brush_radius = adj.get_value()
         self.viewer.queue_draw()
 
     def _on_paint(self, phase: str, x: float, y: float) -> None:
         r = self.retoucher
-        if r is None or self.selected is None or self._showing != "result":
+        if r is None or self._showing != "result":
             return
-        idx = self.selected
+        idx = ALT if self._alt_source() else self.selected
+        if idx is None:
+            return
         if phase == "begin":
-            if self._is_skipped(idx):
+            if idx == ALT and self.alt_image is None:
+                self._toast("Chwila – wynik drugiej metody jeszcze się oblicza")
+                self._last_paint = None
+                return
+            if idx == ALT and not r.has_frame(ALT):
+                r.frame(ALT)
+            if idx != ALT and self._is_skipped(idx):
                 self._preload_frame(idx)  # pokaże wyjaśnienie
                 self._last_paint = None
                 return
