@@ -874,7 +874,8 @@ class MainWindow(Adw.ApplicationWindow):
         d.present(self)
 
     def _on_about(self, *_):
-        d = Adw.AboutDialog(application_name="Focus Stack", version="0.1",
+        from .. import __version__
+        d = Adw.AboutDialog(application_name="Focus Stack", version=__version__,
                             comments="Dopasowanie i łączenie zdjęć makro o różnej płaszczyźnie "
                                      "ostrości.", license_type=Gtk.License.MIT_X11,
                             application_icon="camera-photo-symbolic")

@@ -17,7 +17,7 @@ SERIES = os.path.join(os.path.dirname(__file__), "..", "Seria-z-bledem")
 def main() -> int:
     paths = sorted(glob.glob(os.path.join(SERIES, "*.jpg")))
     if not paths:
-        print("Brak serii testowej - pomijam")
+        print("Brak serii testowej - pomijam (przywrócenie: zob. README, sekcja Testy)")
         return 0
     al = align.align(paths)
     w, h = al.size

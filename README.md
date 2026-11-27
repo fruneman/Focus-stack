@@ -4,14 +4,28 @@ Proste narzędzie do focus stackingu zdjęć makro na Linuksa (JPG, TIFF 8/16 bi
 
 ## Instalacja (Fedora)
 
-Jednorazowo, w katalogu z programem:
+Jednorazowo:
 
 ```bash
+git clone https://github.com/fruneman/Focus-stack.git
+cd Focus-stack
 ./install.sh
 ```
 
 Skrypt instaluje pakiety `python3-gobject gtk4 libadwaita python3-opencv python3-numpy python3-pillow`
 i dodaje „Focus Stack” do menu aplikacji GNOME (oraz do „Otwórz za pomocą” dla JPG/TIFF/PNG).
+
+## Aktualizacja
+
+W katalogu `Focus-stack`:
+
+```bash
+git pull
+./install.sh
+```
+
+Gałąź `main` zawiera zawsze sprawdzoną wersję; nowe funkcje powstają na osobnych gałęziach
+i trafiają do `main` przez pull request. Numer wersji jest widoczny w menu → „O programie”.
 
 ## Obsługa
 
@@ -33,7 +47,7 @@ i dodaje „Focus Stack” do menu aplikacji GNOME (oraz do „Otwórz za pomoc�
 2. **Łączenie (stack)**
    - `pyramid` - odpowiednik PMax z redukcją echa (ocena ostrości w otoczeniu piksela,
      decyzje drobnych warstw wpływają na grubsze, filtr spójności),
-   - `depthmap` - odpowiednik DMAP (mapa głębi z płynnymi przejściami).
+   - `depthmap` - odpowiednik DMAP (mapa głębi z płynnymi przejściami) - w przebudowie.
 
 ## Testy
 
@@ -43,4 +57,10 @@ python -m tests.test_retouch
 python -m tests.test_align_robust
 ```
 
-Generuje syntetyczną serię o znanym wyniku i mierzy dokładność dopasowania oraz jakość.
+`test_quality` generuje syntetyczną serię o znanym wyniku i mierzy dokładność dopasowania
+oraz jakość. `test_align_robust` potrzebuje prawdziwej serii testowej, która nie jest
+przechowywana w `main` (oszczędność ~160 MB). Przywrócenie serii testowych z historii git:
+
+```bash
+git checkout 0b009f8 -- Stonoga-stack Pajak-stack Seria-z-bledem Seria-niedopasowana
+```
