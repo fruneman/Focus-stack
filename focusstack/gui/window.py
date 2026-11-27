@@ -16,6 +16,18 @@ from ..retouch import Retoucher
 from .viewer import ImageViewer
 
 THUMB = 72
+BRUSH_MIN, BRUSH_MAX = 2.0, 600.0   # promień pędzla w pikselach obrazu
+HARD_MAX = 0.95                     # 100% na suwaku = prawie ostra krawędź
+
+
+def brush_to_slider(radius: float) -> float:
+    """Skala logarytmiczna: każdy odcinek suwaka zmienia rozmiar o tyle samo procent."""
+    r = min(max(radius, BRUSH_MIN), BRUSH_MAX)
+    return 1000.0 * np.log(r / BRUSH_MIN) / np.log(BRUSH_MAX / BRUSH_MIN)
+
+
+def slider_to_brush(pos: float) -> float:
+    return BRUSH_MIN * (BRUSH_MAX / BRUSH_MIN) ** (pos / 1000.0)
 ALT = -1   # "numer klatki" oznaczający wynik drugiej metody jako źródło pędzla
 METHODS = [("pyramid", "Piramida"),
            ("depthmap", "Mapa głębi")]
@@ -164,20 +176,28 @@ class MainWindow(Adw.ApplicationWindow):
         self.retouch_group.add(self.source_row)
 
         brush_row = Adw.ActionRow(title="Rozmiar pędzla", subtitle="Ctrl + kółko myszy, [ ]")
-        self.brush_adj = Gtk.Adjustment(value=40, lower=2, upper=600, step_increment=1)
+        self.brush_adj = Gtk.Adjustment(value=brush_to_slider(40), lower=0, upper=1000,
+                                        step_increment=10, page_increment=50)
         brush_scale = Gtk.Scale(adjustment=self.brush_adj, hexpand=True, draw_value=False,
                                 valign=Gtk.Align.CENTER)
         brush_scale.set_size_request(120, -1)
+        self.brush_label = Gtk.Label(label="40 px", width_chars=6, xalign=1)
+        self.brush_label.add_css_class("numeric")
         self.brush_adj.connect("value-changed", self._on_brush_changed)
         brush_row.add_suffix(brush_scale)
+        brush_row.add_suffix(self.brush_label)
         self.retouch_group.add(brush_row)
 
         hard_row = Adw.ActionRow(title="Twardość krawędzi")
-        self.hard_adj = Gtk.Adjustment(value=0.3, lower=0.0, upper=0.95, step_increment=0.05)
+        self.hard_adj = Gtk.Adjustment(value=30, lower=0, upper=100, step_increment=5,
+                                       page_increment=10)
         hard_scale = Gtk.Scale(adjustment=self.hard_adj, hexpand=True, draw_value=False,
                                valign=Gtk.Align.CENTER)
         hard_scale.set_size_request(120, -1)
+        self.hard_label = Gtk.Label(label="30%", width_chars=6, xalign=1)
+        self.hard_label.add_css_class("numeric")
         hard_row.add_suffix(hard_scale)
+        hard_row.add_suffix(self.hard_label)
         self.retouch_group.add(hard_row)
         self.hard_adj.connect("value-changed", self._on_hardness_changed)
 
@@ -234,7 +254,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.viewer = ImageViewer()
         self.viewer.on_paint = self._on_paint
         self.viewer.on_zoom_changed = self._on_zoom_changed
-        self.viewer.on_brush_changed = lambda r: self.brush_adj.set_value(r)
+        self.viewer.on_brush_changed = self._set_brush_radius
 
         overlay = Gtk.Overlay(child=self.viewer)
         # zoom
@@ -318,9 +338,9 @@ class MainWindow(Adw.ApplicationWindow):
             "toggle-view": (self._toggle_view, ["Tab"]),
             "toggle-preview": (lambda *_: self.preview_row.set_active(
                 not self.preview_row.get_active()), ["p"]),
-            "brush-smaller": (lambda *_: self.brush_adj.set_value(self.brush_adj.get_value() / 1.2),
+            "brush-smaller": (lambda *_: self._set_brush_radius(self._brush_radius() / 1.2),
                               ["bracketleft"]),
-            "brush-bigger": (lambda *_: self.brush_adj.set_value(self.brush_adj.get_value() * 1.2),
+            "brush-bigger": (lambda *_: self._set_brush_radius(self._brush_radius() * 1.2),
                              ["bracketright"]),
             "shortcuts": (self._on_shortcuts, ["<Ctrl>question"]),
             "about": (self._on_about, []),
@@ -869,8 +889,18 @@ class MainWindow(Adw.ApplicationWindow):
         self.viewer.brush_preview = row.get_active()
         self.viewer.queue_draw()
 
+    def _hardness(self) -> float:
+        return self.hard_adj.get_value() / 100.0 * HARD_MAX
+
+    def _brush_radius(self) -> float:
+        return slider_to_brush(self.brush_adj.get_value())
+
+    def _set_brush_radius(self, radius: float) -> None:
+        self.brush_adj.set_value(brush_to_slider(radius))
+
     def _on_hardness_changed(self, adj) -> None:
-        self.viewer.brush_hardness = adj.get_value()
+        self.hard_label.set_label(f"{round(adj.get_value())}%")
+        self.viewer.brush_hardness = self._hardness()
         self.viewer.queue_draw()
 
     def _refresh_brush_source(self) -> bool:
@@ -887,7 +917,9 @@ class MainWindow(Adw.ApplicationWindow):
         return False
 
     def _on_brush_changed(self, adj) -> None:
-        self.viewer.brush_radius = adj.get_value()
+        r = self._brush_radius()
+        self.brush_label.set_label(f"{round(r)} px")
+        self.viewer.brush_radius = r
         self.viewer.queue_draw()
 
     def _on_paint(self, phase: str, x: float, y: float) -> None:
@@ -913,13 +945,12 @@ class MainWindow(Adw.ApplicationWindow):
                 self._last_paint = None
                 return
             r.begin_stroke()
-            box = r.dab(idx, x, y, self.brush_adj.get_value(), self.hard_adj.get_value())
+            box = r.dab(idx, x, y, self._brush_radius(), self._hardness())
             self._last_paint = (x, y)
         elif phase == "move":
             if self._last_paint is None:
                 return
-            box = r.line(idx, *self._last_paint, x, y, self.brush_adj.get_value(),
-                         self.hard_adj.get_value())
+            box = r.line(idx, *self._last_paint, x, y, self._brush_radius(), self._hardness())
             self._last_paint = (x, y)
         else:
             if self._last_paint is not None:

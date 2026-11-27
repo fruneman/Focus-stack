@@ -59,11 +59,13 @@ class Retoucher:
     @staticmethod
     def brush_mask(d: np.ndarray, hardness: float) -> np.ndarray:
         """Krycie pędzla w funkcji odległości od środka (d: 0 = środek, 1 = krawędź).
-        hardness 0 = bardzo miękkie wtapianie od samego środka, ~1 = ostra krawędź."""
+
+        hardness = część promienia kryjąca w 100%; dalej krycie gładko spada do zera dokładnie
+        na brzegu kółka. Szerokość wtapiania zmienia się liniowo z twardością (0 -> wtapianie
+        od środka do brzegu, ~1 -> ostra krawędź), a kółko kursora zawsze pokazuje zasięg."""
         h = float(np.clip(hardness, 0.0, 0.95))
         t = np.clip((1.0 - d) / (1.0 - h), 0.0, 1.0)
-        m = t * t * (3 - 2 * t)                    # gładkie wygaszanie
-        return m ** (1.0 + 1.5 * (1.0 - h))        # im miększy pędzel, tym dłuższe wtapianie
+        return t * t * (3 - 2 * t)                 # gładkie wygaszanie (smoothstep)
 
     def dab(self, index: int, x: float, y: float, radius: float,
             hardness: float = 0.3, opacity: float = 1.0) -> tuple[int, int, int, int] | None:

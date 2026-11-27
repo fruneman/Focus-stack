@@ -76,7 +76,7 @@ class ImageViewer(Gtk.DrawingArea):
         self._cursor: tuple[float, float] | None = None
         # podgląd źródła pod pędzlem
         self.brush_preview = True
-        self.brush_hardness = 0.3
+        self.brush_hardness = 0.3 * 0.95
         self._src: _Mips | None = None
         self._src_key = None
         self._src_gen = 0
@@ -275,7 +275,7 @@ class ImageViewer(Gtk.DrawingArea):
     def _scroll(self, ctrl, dx, dy) -> bool:
         state = ctrl.get_current_event_state()
         if self.paint_mode and state & Gdk.ModifierType.CONTROL_MASK:
-            self.brush_radius = float(np.clip(self.brush_radius * (0.9 if dy > 0 else 1.1), 2, 600))
+            self.brush_radius = float(np.clip(self.brush_radius * (1 / 1.1 if dy > 0 else 1.1), 2, 600))
             if self.on_brush_changed:
                 self.on_brush_changed(self.brush_radius)
             self.queue_draw()
