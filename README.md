@@ -36,6 +36,7 @@ i dodaje „Focus Stack” do menu aplikacji GNOME (oraz do „Otwórz za pomoc�
 ```bash
 python -m tests.test_quality
 python -m tests.test_retouch
+python -m tests.test_align_robust
 ```
 
 Generuje syntetyczną serię o znanym wyniku i mierzy dokładność dopasowania oraz jakość.

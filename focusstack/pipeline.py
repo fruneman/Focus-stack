@@ -10,6 +10,7 @@ import numpy as np
 from . import align as align_mod
 from . import imageio
 from . import stack as stack_mod
+from .errors import StackError
 
 ProgressFn = Callable[[float, str], None]
 
@@ -41,6 +42,7 @@ class Result:
     paths: list[str]
     crop: tuple[int, int, int, int] | None
     depth: np.ndarray | None = None
+    skipped: list[str] | None = None   # klatki pominięte (nie udało się ich dopasować)
 
     def frame(self, index: int) -> np.ndarray:
         """Klatka źródłowa dopasowana i przycięta dokładnie jak wynik (do retuszu)."""
@@ -65,15 +67,32 @@ def run(paths: Sequence[str], settings: Settings | None = None,
 
     paths = list(paths)
     if len(paths) < 2:
-        raise ValueError("Potrzebne są co najmniej 2 zdjęcia")
+        raise StackError("Za mało zdjęć", "Do połączenia potrzebne są co najmniej 2 zdjęcia.",
+                         ["Dodaj pozostałe klatki serii."])
 
     def sub(a: float, b: float) -> ProgressFn:
         return lambda f, m: progress(a + (b - a) * f, m)
 
+    def stage(name: str, fn):
+        """Uruchamia etap; nieprzewidziany błąd opisuje nazwą etapu."""
+        try:
+            return fn()
+        except (StackError, Cancelled):
+            raise
+        except Exception as e:  # noqa: BLE001 - zamieniamy na opis dla użytkownika
+            raise StackError.unexpected(name, e) from e
+
     if settings.do_align:
-        al = align_mod.align(paths, progress=sub(0.0, 0.3))
+        al = stage("Wczytywanie i dopasowanie zdjęć",
+                   lambda: align_mod.align(paths, progress=sub(0.0, 0.3)))
     else:
-        al = align_mod.identity(paths)
+        al = stage("Wczytywanie zdjęć", lambda: align_mod.identity(paths))
+
+    skipped = [paths[i] for i in al.failed]
+    if al.failed:
+        keep = [i for i in range(len(paths)) if i not in al.failed]
+        paths = [paths[i] for i in keep]
+        al = al.subset(keep)
 
     bits = 8
 
@@ -83,14 +102,15 @@ def run(paths: Sequence[str], settings: Settings | None = None,
         bits = max(bits, b)
         return al.warp(img, i)
 
-    depth = None
-    if settings.method == "depthmap":
-        img, depth = stack_mod.stack_depthmap(len(paths), load, sub(0.3, 1.0),
-                                              settings.smoothing, settings.contrast)
-    else:
-        img = stack_mod.stack_pyramid(len(paths), load, sub(0.3, 1.0), settings.neighborhood,
-                                      settings.consistency, settings.fine_weight,
-                                      settings.base_sharpness)
+    def do_stack():
+        if settings.method == "depthmap":
+            return stack_mod.stack_depthmap(len(paths), load, sub(0.3, 1.0),
+                                            settings.smoothing, settings.contrast)
+        return stack_mod.stack_pyramid(len(paths), load, sub(0.3, 1.0), settings.neighborhood,
+                                       settings.consistency, settings.fine_weight,
+                                       settings.base_sharpness), None
+
+    img, depth = stage("Łączenie zdjęć", do_stack)
 
     crop = al.crop if settings.crop else None
     if crop:
@@ -99,4 +119,5 @@ def run(paths: Sequence[str], settings: Settings | None = None,
         if depth is not None:
             depth = depth[y:y + h, x:x + w]
 
-    return Result(image=img, bits=bits, alignment=al, paths=paths, crop=crop, depth=depth)
+    return Result(image=img, bits=bits, alignment=al, paths=paths, crop=crop, depth=depth,
+                  skipped=skipped)

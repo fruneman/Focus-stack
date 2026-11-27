@@ -11,6 +11,7 @@ from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk
 from PIL import Image
 
 from .. import imageio, pipeline
+from ..errors import StackError
 from ..retouch import Retoucher
 from .viewer import ImageViewer
 
@@ -269,6 +270,8 @@ class MainWindow(Adw.ApplicationWindow):
             .progress-card { padding: 24px 32px; }
             .zoom-box { padding: 4px; border-radius: 12px; }
             .thumb { border-radius: 6px; }
+            row.skipped .subtitle { color: @warning_color; }
+            row.skipped .thumb { opacity: 0.45; }
         """, -1)
         Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), css,
                                                   Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
@@ -330,6 +333,52 @@ class MainWindow(Adw.ApplicationWindow):
         if self.dirty:
             title = "• " + title
         self.set_title(title)
+
+    def _show_error(self, error: BaseException, stage: str = "Działanie programu") -> None:
+        """Okno błędu: co się stało, dlaczego, co zrobić (+ szczegóły do skopiowania)."""
+        err = error if isinstance(error, StackError) else StackError.unexpected(stage, error)
+        details = err.details
+        if details is None and not isinstance(error, StackError):
+            details = "".join(traceback.format_exception(type(error), error,
+                                                         error.__traceback__))
+        self._log_error(err, details)
+        body = err.explanation
+        if err.hints:
+            body += "\n\nCo możesz zrobić:\n" + "\n".join(f"• {h}" for h in err.hints)
+        d = Adw.AlertDialog(heading=err.title, body=body)
+        if details:
+            view = Gtk.TextView(editable=False, monospace=True, wrap_mode=Gtk.WrapMode.WORD_CHAR,
+                                top_margin=6, bottom_margin=6, left_margin=6, right_margin=6)
+            view.get_buffer().set_text(details)
+            sc = Gtk.ScrolledWindow(child=view, min_content_height=160, max_content_height=240)
+            sc.add_css_class("card")
+            d.set_extra_child(Gtk.Expander(label="Szczegóły techniczne", child=sc))
+            d.add_response("copy", "Kopiuj szczegóły")
+        d.add_response("ok", "OK")
+        d.set_default_response("ok")
+
+        def on_response(_d, r):
+            if r == "copy":
+                text = f"{err.title}\n\n{err.explanation}\n\n{details}"
+                self.get_clipboard().set(text)
+                self._toast("Skopiowano do schowka")
+
+        d.connect("response", on_response)
+        d.present(self)
+
+    @staticmethod
+    def _log_error(err: StackError, details: str | None) -> None:
+        """Zapis do ~/.cache/focus-stack/bledy.log - przydatne przy zgłaszaniu problemów."""
+        try:
+            import datetime
+            folder = os.path.join(GLib.get_user_cache_dir(), "focus-stack")
+            os.makedirs(folder, exist_ok=True)
+            with open(os.path.join(folder, "bledy.log"), "a", encoding="utf-8") as f:
+                f.write(f"\n=== {datetime.datetime.now():%Y-%m-%d %H:%M:%S} ===\n{err}\n")
+                if details:
+                    f.write(details + "\n")
+        except OSError:
+            pass
 
     def _toast(self, text: str, timeout: int = 3) -> None:
         self.toasts.add_toast(Adw.Toast(title=text, timeout=timeout))
@@ -464,7 +513,7 @@ class MainWindow(Adw.ApplicationWindow):
         if self.selected is None:
             return
         idx = self.selected
-        if self.retoucher is not None:
+        if self.retoucher is not None and not self._is_skipped(idx):
             if self.retoucher.has_frame(idx):
                 self.viewer.set_image(self.retoucher.frame(idx))
             else:
@@ -475,8 +524,8 @@ class MainWindow(Adw.ApplicationWindow):
         def work():
             try:
                 img, _ = imageio.load(path)
-            except Exception as e:
-                GLib.idle_add(self._toast, f"Nie można wczytać: {os.path.basename(path)} ({e})")
+            except Exception as e:  # noqa: BLE001
+                GLib.idle_add(self._show_error, e, "Wczytywanie zdjęcia")
                 return
             GLib.idle_add(self._show_loaded, idx, img)
 
@@ -491,6 +540,10 @@ class MainWindow(Adw.ApplicationWindow):
         r = self.retoucher
         if r is None:
             return
+        if self._is_skipped(idx):
+            self._toast("Ta klatka została pominięta przy łączeniu (nie pasuje do reszty "
+                        "serii), więc nie może być źródłem retuszu. Wybierz inną.", 6)
+            return
         if r.has_frame(idx):
             if show:
                 self.viewer.set_image(r.frame(idx))
@@ -501,8 +554,8 @@ class MainWindow(Adw.ApplicationWindow):
             with self._lock:
                 try:
                     r.frame(idx)
-                except Exception as e:
-                    GLib.idle_add(self._toast, f"Błąd wczytywania klatki: {e}")
+                except Exception as e:  # noqa: BLE001
+                    GLib.idle_add(self._show_error, e, "Wczytywanie klatki do retuszu")
                     return
             if show:
                 GLib.idle_add(self._show_after_preload, idx)
@@ -577,9 +630,8 @@ class MainWindow(Adw.ApplicationWindow):
             except pipeline.Cancelled:
                 GLib.idle_add(self._stack_done, None, None)
                 return
-            except Exception as e:
-                traceback.print_exc()
-                GLib.idle_add(self._stack_done, None, str(e))
+            except Exception as e:  # noqa: BLE001
+                GLib.idle_add(self._stack_done, None, e)
                 return
             GLib.idle_add(self._stack_done, res, None)
 
@@ -598,23 +650,66 @@ class MainWindow(Adw.ApplicationWindow):
         self._busy = False
         self.progress_card.set_visible(False)
         if error:
-            self._toast(f"Błąd: {error}", timeout=8)
+            self._show_error(error, stage="Łączenie zdjęć")
         elif res is None:
             self._toast("Przerwano")
         else:
             self.result = res
-            self.retoucher = Retoucher(res.image, res.frame)
+            gui_paths = list(self.paths)
+
+            def load_for_gui(i: int):
+                # numer klatki na liście w oknie -> numer wśród faktycznie połączonych klatek
+                return res.frame(res.paths.index(gui_paths[i]))
+
+            self.retoucher = Retoucher(res.image, load_for_gui)
             self.dirty = True
             self._showing = "result"
             self.view_result_btn.set_active(True)
             self.viewer.set_image(res.image, keep_view=False)
-            warn = res.alignment.warnings
-            if warn:
-                self._toast(f"Gotowe. Uwaga: {len(warn)} klatek dopasowano mniej dokładnie", 6)
+            self._mark_skipped()
+            if res.skipped:
+                self._report_skipped(res)
             else:
-                self._toast("Gotowe")
+                fallback = [w for w in res.alignment.warnings if "zapasow" in w]
+                if fallback:
+                    self._toast(f"Gotowe. {len(fallback)} klatek dopasowano metodą zapasową – "
+                                "warto obejrzeć wynik w powiększeniu", 6)
+                else:
+                    self._toast("Gotowe")
         self._update_state()
         return False
+
+    def _is_skipped(self, idx: int | None) -> bool:
+        return bool(idx is not None and self.result and self.result.skipped
+                    and self.paths[idx] in self.result.skipped)
+
+    def _mark_skipped(self) -> None:
+        for i, row in enumerate(self.rows):
+            if self._is_skipped(i):
+                row.set_subtitle("Pominięta – nie pasuje do pozostałych klatek")
+                row.add_css_class("skipped")
+            else:
+                row.set_subtitle("")
+                row.remove_css_class("skipped")
+
+    def _report_skipped(self, res) -> None:
+        reasons = {}
+        for w in res.alignment.warnings:
+            name, _, why = w.partition(": ")
+            reasons[name] = why.replace("pominięta – ", "")
+        lines = "\n".join(f"• {os.path.basename(p)} – {reasons.get(os.path.basename(p), '')}"
+                          for p in res.skipped)
+        total = len(res.paths) + len(res.skipped)
+        d = Adw.AlertDialog(
+            heading=f"Połączono {len(res.paths)} z {total} zdjęć",
+            body=f"Tych zdjęć nie udało się dopasować do reszty serii, więc zostały pominięte:\n"
+                 f"{lines}\n\nCo możesz zrobić:\n"
+                 "• Jeśli to zdjęcia z innego ujęcia – usuń je z listy, wynik jest gotowy.\n"
+                 "• Jeśli należą do serii – zwykle brakuje klatek pośrednich (zbyt duży skok "
+                 "ostrości). Dodaj je i połącz ponownie.\n"
+                 "• Pominięte zdjęcia są oznaczone na liście klatek.")
+        d.add_response("ok", "OK")
+        d.present(self)
 
     # =====================================================================
     # Retusz
@@ -642,6 +737,10 @@ class MainWindow(Adw.ApplicationWindow):
             return
         idx = self.selected
         if phase == "begin":
+            if self._is_skipped(idx):
+                self._preload_frame(idx)  # pokaże wyjaśnienie
+                self._last_paint = None
+                return
             if not r.has_frame(idx):
                 self._toast("Chwila - klatka jeszcze się wczytuje")
                 self._last_paint = None
@@ -713,8 +812,8 @@ class MainWindow(Adw.ApplicationWindow):
         def work():
             try:
                 imageio.save(path, img, bits, exif_source=src)
-            except Exception as e:
-                GLib.idle_add(self._toast, f"Nie udało się zapisać: {e}", 8)
+            except Exception as e:  # noqa: BLE001
+                GLib.idle_add(self._show_error, e, "Zapis wyniku")
                 return
             GLib.idle_add(self._saved, path)
 

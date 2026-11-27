@@ -17,6 +17,7 @@ współrzędne danej klatki. Warp wykonujemy z flagą WARP_INVERSE_MAP.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Callable, Sequence
 
@@ -24,6 +25,7 @@ import cv2
 import numpy as np
 
 from . import imageio
+from .errors import StackError
 
 ProgressFn = Callable[[float, str], None]
 
@@ -36,6 +38,14 @@ class Alignment:
     gains: list[np.ndarray] = field(default_factory=list)  # (3,) mnożnik BGR
     crop: tuple[int, int, int, int] | None = None          # x, y, w, h wspólnego obszaru
     warnings: list[str] = field(default_factory=list)
+    failed: list[int] = field(default_factory=list)       # klatki, których nie dopasowano
+
+    def subset(self, keep: Sequence[int]) -> "Alignment":
+        """Dopasowanie ograniczone do wybranych klatek (np. bez nieudanych)."""
+        return Alignment(size=self.size, ref_index=list(keep).index(self.ref_index),
+                         matrices=[self.matrices[i] for i in keep],
+                         gains=[self.gains[i] for i in keep] if self.gains else [],
+                         crop=self.crop, warnings=self.warnings, failed=[])
 
     def warp(self, img: np.ndarray, index: int) -> np.ndarray:
         w, h = self.size
@@ -80,45 +90,118 @@ class _Features:
         return self.cache[idx]
 
 
-def _estimate_pair(feat: _Features, ia: int, a: np.ndarray, ib: int, b: np.ndarray
-                   ) -> tuple[np.ndarray, str | None]:
-    """Szacuje macierz 2x3 mapującą współrzędne obrazu A na obraz B (mała skala)."""
-    a8, b8 = _prep(a), _prep(b)
-    init = np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32)
-    warn = None
+MIN_INLIERS = 20      # tyle zgodnych punktów SIFT uznajemy za wiarygodne dopasowanie
+MIN_ECC_CC = 0.85     # minimalna korelacja ECC dla metody zapasowej
 
-    # 1) Zgrubnie: SIFT + RANSAC
+
+def _plausible(m: np.ndarray, shape: tuple[int, int]) -> bool:
+    """Czy przekształcenie ma sens dla dwóch sąsiednich klatek serii makro?"""
+    if m is None or not np.all(np.isfinite(m)):
+        return False
+    a, c = m[0, 0], m[1, 0]
+    scale = float(np.hypot(a, c))
+    rot = abs(float(np.degrees(np.arctan2(c, a))))
+    h, w = shape
+    center = m[:2, :2] @ np.array([w / 2, h / 2]) + m[:2, 2]
+    shift = float(np.hypot(center[0] - w / 2, center[1] - h / 2))
+    return 0.75 < scale < 1.33 and rot < 10.0 and shift < 0.45 * max(h, w)
+
+
+def _sift_pair(feat: _Features, ia: int, a8: np.ndarray, ib: int, b8: np.ndarray):
+    """SIFT + RANSAC. Zwraca (macierz 2x3, liczba zgodnych punktów) albo (None, n)."""
     ka, da = feat.get(ia, a8)
     kb, db = feat.get(ib, b8)
-    if da is not None and db is not None and len(ka) >= 8 and len(kb) >= 8:
-        matches = feat.matcher.knnMatch(da, db, k=2)
-        good = [m for m, n in (p for p in matches if len(p) == 2) if m.distance < 0.75 * n.distance]
-        if len(good) >= 8:
-            pa = np.float32([ka[m.queryIdx].pt for m in good])
-            pb = np.float32([kb[m.trainIdx].pt for m in good])
-            m, inl = cv2.estimateAffinePartial2D(pa, pb, method=cv2.RANSAC,
-                                                 ransacReprojThreshold=2.0, maxIters=5000,
-                                                 confidence=0.999)
-            if m is not None and inl is not None and inl.sum() >= 8:
-                init = m.astype(np.float32)
+    if da is None or db is None or len(ka) < 8 or len(kb) < 8:
+        return None, 0
+    matches = feat.matcher.knnMatch(da, db, k=2)
+    good = [m for m, n in (p for p in matches if len(p) == 2) if m.distance < 0.75 * n.distance]
+    if len(good) < 8:
+        return None, len(good)
+    pa = np.float32([ka[m.queryIdx].pt for m in good])
+    pb = np.float32([kb[m.trainIdx].pt for m in good])
+    m, inl = cv2.estimateAffinePartial2D(pa, pb, method=cv2.RANSAC, ransacReprojThreshold=2.0,
+                                         maxIters=5000, confidence=0.999)
+    n_inl = int(inl.sum()) if inl is not None else 0
+    if m is None or n_inl < MIN_INLIERS or not _plausible(m, a8.shape):
+        return None, n_inl
+    return m.astype(np.float32), n_inl
 
-    # 2) Dokładnie: ECC na lekko rozmytych obrazach
-    af = cv2.GaussianBlur(a8.astype(np.float32) / 255.0, (0, 0), 1.0)
-    bf = cv2.GaussianBlur(b8.astype(np.float32) / 255.0, (0, 0), 1.0)
-    criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 200, 1e-6)
-    try:
-        _, m = cv2.findTransformECC(af, bf, init.copy(), cv2.MOTION_AFFINE, criteria, None, 5)
-        m = _to_similarity(m)
-        # Zabezpieczenie: ECC nie może "uciec" daleko od wyniku SIFT
-        drift = np.abs(m[:, 2] - init[:, 2]).max()
-        scale_diff = abs(np.hypot(m[0, 0], m[1, 0]) - np.hypot(init[0, 0], init[1, 0]))
-        if drift > 0.02 * max(a.shape) or scale_diff > 0.02:
-            warn = "ECC odrzucone, użyto dopasowania punktów"
+
+def _resize(g: np.ndarray, size: int) -> np.ndarray:
+    h, w = g.shape
+    s = size / max(h, w)
+    return cv2.resize(g, (max(1, round(w * s)), max(1, round(h * s))), interpolation=cv2.INTER_AREA)
+
+
+def _coarse_to_fine(a: np.ndarray, b: np.ndarray):
+    """Metoda zapasowa dla klatek o bardzo różnej ostrości (SIFT nie znajduje wspólnych
+    punktów): porównanie całych, rozmytych kształtów jasności. Najpierw zgrubne
+    przesunięcie przez dopasowanie wzorca, potem ECC od małej do dużej rozdzielczości.
+    Zwraca (macierz 2x3 A->B w rozdzielczości roboczej, korelacja) albo (None, 0)."""
+    work = max(a.shape)
+    a3 = cv2.GaussianBlur(_resize(a, 300), (0, 0), 3)
+    b3 = cv2.GaussianBlur(_resize(b, 300), (0, 0), 3)
+    h, w = b3.shape
+    mg = 0.2
+    tpl = b3[int(h * mg):int(h * (1 - mg)), int(w * mg):int(w * (1 - mg))]
+    pad = cv2.copyMakeBorder(a3, h // 3, h // 3, w // 3, w // 3, cv2.BORDER_REPLICATE)
+    res = cv2.matchTemplate(pad, tpl, cv2.TM_CCOEFF_NORMED)
+    _, score, _, loc = cv2.minMaxLoc(res)
+    if score < 0.5:
+        return None, 0.0
+    tx = loc[0] - w // 3 - int(w * mg)
+    ty = loc[1] - h // 3 - int(h * mg)
+    m = np.float32([[1, 0, -tx], [0, 1, -ty]])
+
+    cc, prev = 0.0, 300
+    criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 100, 1e-5)
+    for size, sig in ((300, 3.0), (600, 2.0), (1200, 1.2), (work, 1.0)):
+        size = min(size, work)
+        m[:, 2] *= size / prev
+        prev = size
+        af = cv2.GaussianBlur(_resize(a, size), (0, 0), sig).astype(np.float32)
+        bf = cv2.GaussianBlur(_resize(b, size), (0, 0), sig).astype(np.float32)
+        try:
+            cc, m = cv2.findTransformECC(af, bf, m, cv2.MOTION_AFFINE, criteria, None, 5)
+        except cv2.error:
+            return None, 0.0
+        if size == work:
+            break
+    m = _to_similarity(m)
+    if not _plausible(m, a.shape) or cc < MIN_ECC_CC:
+        return None, float(cc)
+    return m.astype(np.float32), float(cc)
+
+
+def _estimate_pair(feat: _Features, ia: int, a: np.ndarray, ib: int, b: np.ndarray
+                   ) -> tuple[np.ndarray | None, str | None]:
+    """Szacuje macierz 2x3 mapującą współrzędne obrazu A na obraz B (rozdzielczość robocza).
+    Zwraca (macierz, ostrzeżenie) albo (None, powód), gdy dopasowanie się nie udało."""
+    a8, b8 = _prep(a), _prep(b)
+
+    # 1) SIFT + RANSAC, doprecyzowane przez ECC
+    init, n_inl = _sift_pair(feat, ia, a8, ib, b8)
+    if init is not None:
+        af = cv2.GaussianBlur(a8.astype(np.float32) / 255.0, (0, 0), 1.0)
+        bf = cv2.GaussianBlur(b8.astype(np.float32) / 255.0, (0, 0), 1.0)
+        criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 200, 1e-6)
+        try:
+            _, m = cv2.findTransformECC(af, bf, init.copy(), cv2.MOTION_AFFINE, criteria, None, 5)
+            m = _to_similarity(m)
+            drift = np.abs(m[:, 2] - init[:, 2]).max()
+            scale_diff = abs(np.hypot(m[0, 0], m[1, 0]) - np.hypot(init[0, 0], init[1, 0]))
+            if drift > 0.02 * max(a.shape) or scale_diff > 0.02 or not _plausible(m, a.shape):
+                m = init
+        except cv2.error:
             m = init
-    except cv2.error:
-        warn = "ECC nie zbiegło się, użyto dopasowania punktów"
-        m = init
-    return m.astype(np.float64), warn
+        return m.astype(np.float64), None
+
+    # 2) Metoda zapasowa - porównanie całych kształtów
+    m, cc = _coarse_to_fine(a, b)
+    if m is not None:
+        return m.astype(np.float64), "mało wspólnych szczegółów – dopasowano metodą zapasową"
+    return None, ("nie pasuje do sąsiednich klatek (inne ujęcie albo zbyt duży skok "
+                  "ostrości lub kadru)")
 
 
 def _gain(ref: np.ndarray, img: np.ndarray) -> np.ndarray:
@@ -137,6 +220,8 @@ def _common_crop(matrices: Sequence[np.ndarray], size: tuple[int, int]) -> tuple
     corners = np.array([[0, 0, 1], [w, 0, 1], [w, h, 1], [0, h, 1]], dtype=np.float64).T
     left, top, right, bottom = 0.0, 0.0, float(w), float(h)
     for m in matrices:
+        if abs(np.linalg.det(m)) < 1e-6:
+            continue
         p = np.linalg.inv(m) @ corners  # rogi klatki w układzie odniesienia
         left = max(left, p[0, 0], p[0, 3])
         right = min(right, p[0, 1], p[0, 2])
@@ -153,7 +238,7 @@ def align(paths: Sequence[str], work_size: int = 2000,
           progress: ProgressFn | None = None) -> Alignment:
     n = len(paths)
     if n == 0:
-        raise ValueError("Brak zdjęć")
+        raise StackError("Brak zdjęć", "Lista zdjęć jest pusta.", ["Dodaj zdjęcia serii."])
     progress = progress or (lambda f, m: None)
 
     smalls, thumbs = [], []
@@ -167,7 +252,20 @@ def align(paths: Sequence[str], work_size: int = 2000,
             full_size = (w, h)
             s = min(1.0, work_size / max(w, h))
         elif (w, h) != full_size:
-            raise ValueError(f"Zdjęcie ma inny rozmiar niż pozostałe: {p}")
+            first = os.path.basename(paths[0])
+            orient = ""
+            if (w, h) == (full_size[1], full_size[0]):
+                orient = (" Wygląda na to, że jedno zdjęcie jest pionowe, a drugie poziome "
+                          "(aparat zapisał inną orientację).")
+            raise StackError(
+                "Zdjęcia mają różne wymiary",
+                f"{os.path.basename(p)} ma {w}×{h} px, a {first} ma "
+                f"{full_size[0]}×{full_size[1]} px. Wszystkie klatki serii muszą mieć ten sam "
+                f"rozmiar.{orient}",
+                ["Usuń z listy zdjęcia, które nie należą do serii (np. wykadrowane, "
+                 "zmniejszone albo z innej sesji).",
+                 "Jeśli różnią się tylko orientacją – obróć je w przeglądarce zdjęć tak samo "
+                 "jak resztę serii."])
         small = cv2.resize(img, (round(w * s), round(h * s)), interpolation=cv2.INTER_AREA)
         smalls.append(cv2.cvtColor(small, cv2.COLOR_BGR2GRAY))
         t = 400 / max(w, h)
@@ -180,19 +278,56 @@ def align(paths: Sequence[str], work_size: int = 2000,
     warnings: list[str] = []
     feat = _Features()
 
-    order = [(i, i + 1) for i in range(ref, n - 1)] + [(i, i - 1) for i in range(ref, 0, -1)]
-    for k, (a, b) in enumerate(order):
-        progress(0.3 + 0.6 * k / max(1, len(order)), f"Dopasowywanie {k + 1}/{len(order)}")
-        m, warn = _estimate_pair(feat, a, smalls[a], b, smalls[b])
-        if warn:
-            warnings.append(f"Klatka {b + 1}: {warn}")
-        m3 = np.vstack([m, [0, 0, 1]])
-        small_m[b] = m3 @ small_m[a]
+    failed: list[int] = []
+    done = {ref}
+    total = n - 1
+    step = 0
+    for direction in (1, -1):
+        last = ref
+        b = ref + direction
+        while 0 <= b < n:
+            step += 1
+            progress(0.3 + 0.6 * step / max(1, total), f"Dopasowywanie {step}/{total}")
+            # próbujemy z ostatnią dopasowaną klatką, a potem z 2 wcześniejszymi
+            candidates = [last] + sorted((i for i in done if i != last),
+                                         key=lambda i: abs(i - b))[:2]
+            ok = False
+            reason = None
+            for a in candidates:
+                m, msg = _estimate_pair(feat, a, smalls[a], b, smalls[b])
+                if m is not None:
+                    small_m[b] = np.vstack([m, [0, 0, 1]]) @ small_m[a]
+                    if msg:
+                        warnings.append(f"{os.path.basename(paths[b])}: {msg}")
+                    done.add(b)
+                    last = b
+                    ok = True
+                    break
+                reason = reason or msg
+            if not ok:
+                failed.append(b)
+                warnings.append(f"{os.path.basename(paths[b])}: pominięta – {reason}")
+            b += direction
+
+    ok_frames = n - len(failed)
+    if ok_frames < 2 or len(failed) > n // 2:
+        names = ", ".join(os.path.basename(paths[i]) for i in sorted(failed))
+        raise StackError(
+            "Nie udało się dopasować zdjęć",
+            f"Program nie znalazł wspólnych elementów między klatkami: {names}. Zwykle znaczy "
+            "to, że między kolejnymi zdjęciami ostrość albo kadr zmieniają się zbyt mocno, "
+            "albo że na liście są zdjęcia z różnych ujęć.",
+            ["Sprawdź, czy wszystkie zdjęcia na liście należą do tej samej serii.",
+             "Dodaj brakujące klatki pośrednie – im mniejszy skok ostrości między kolejnymi "
+             "zdjęciami, tym pewniejsze dopasowanie.",
+             "Jeśli zdjęcia były robione ze statywu i się nie przesuwają – wyłącz "
+             "„Dopasuj zdjęcia”."])
 
     # Przeliczenie na pełną rozdzielczość: M_full = S^-1 · M_small · S
     sm = np.diag([s, s, 1.0])
     sm_inv = np.diag([1 / s, 1 / s, 1.0])
     matrices = [sm_inv @ m @ sm for m in small_m]
+    ok_idx = [i for i in range(n) if i not in failed]
 
     # Wyrównanie jasności (na małych kolorowych podglądach)
     progress(0.92, "Wyrównywanie jasności")
@@ -200,7 +335,7 @@ def align(paths: Sequence[str], work_size: int = 2000,
     tm, tm_inv = np.diag([t, t, 1.0]), np.diag([1 / t, 1 / t, 1.0])
     gains = []
     for i in range(n):
-        if i == ref:
+        if i == ref or i in failed:
             gains.append(np.ones(3, np.float32))
             continue
         mt = tm @ matrices[i] @ tm_inv
@@ -210,8 +345,8 @@ def align(paths: Sequence[str], work_size: int = 2000,
         gains.append(_gain(thumbs[ref], img))
 
     result = Alignment(size=full_size, ref_index=ref, matrices=matrices, gains=gains,
-                       warnings=warnings)
-    result.crop = _common_crop(matrices, full_size)
+                       warnings=warnings, failed=sorted(failed))
+    result.crop = _common_crop([matrices[i] for i in ok_idx], full_size)
     progress(1.0, "Dopasowanie zakończone")
     return result
 

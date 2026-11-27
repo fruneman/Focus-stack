@@ -11,6 +11,8 @@ import cv2
 import numpy as np
 from PIL import Image
 
+from .errors import load_error, save_error
+
 SUPPORTED_EXT = {".jpg", ".jpeg", ".tif", ".tiff", ".png"}
 
 
@@ -20,10 +22,13 @@ def is_supported(path: str) -> bool:
 
 def load(path: str) -> tuple[np.ndarray, int]:
     """Zwraca (obraz float32 BGR 0..1, głębia bitowa źródła: 8 lub 16)."""
-    data = np.fromfile(path, dtype=np.uint8)  # obsługuje ścieżki z polskimi znakami
-    img = cv2.imdecode(data, cv2.IMREAD_COLOR | cv2.IMREAD_ANYDEPTH)
+    try:
+        data = np.fromfile(path, dtype=np.uint8)  # obsługuje ścieżki z polskimi znakami
+        img = cv2.imdecode(data, cv2.IMREAD_COLOR | cv2.IMREAD_ANYDEPTH)
+    except OSError as e:
+        raise load_error(path, e) from e
     if img is None:
-        raise ValueError(f"Nie udało się wczytać pliku: {path}")
+        raise load_error(path)
     if img.dtype == np.uint16:
         return img.astype(np.float32) / 65535.0, 16
     if img.dtype == np.uint8:
@@ -44,6 +49,14 @@ def load_gray_small(path: str, max_side: int) -> tuple[np.ndarray, float]:
 
 def save(path: str, img: np.ndarray, bits: int = 8, exif_source: str | None = None,
          jpeg_quality: int = 95) -> None:
+    try:
+        _save(path, img, bits, exif_source, jpeg_quality)
+    except Exception as e:
+        raise save_error(path, e) from e
+
+
+def _save(path: str, img: np.ndarray, bits: int, exif_source: str | None,
+          jpeg_quality: int) -> None:
     """Zapisuje wynik. JPG zawsze 8 bit (z kopią EXIF i profilu ICC źródła), TIFF 8 lub 16 bit."""
     ext = os.path.splitext(path)[1].lower()
     img = np.clip(img, 0.0, 1.0)
@@ -71,5 +84,5 @@ def save(path: str, img: np.ndarray, bits: int = 8, exif_source: str | None = No
         arr = (img * 255.0 + 0.5).astype(np.uint8)
     ok, buf = cv2.imencode(ext if ext in (".tif", ".tiff", ".png") else ".tif", arr)
     if not ok:
-        raise ValueError(f"Nie udało się zapisać pliku: {path}")
+        raise OSError(f"kodowanie do formatu {ext} nie powiodło się")
     buf.tofile(path)
